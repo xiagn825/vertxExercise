@@ -10,6 +10,7 @@ import io.vertx.core.json.Json;
 import io.vertx.core.json.JsonArray;
 import io.vertx.core.json.JsonObject;
 import io.vertx.ext.jdbc.JDBCClient;
+import io.vertx.ext.sql.ResultSet;
 import io.vertx.ext.sql.SQLConnection;
 import io.vertx.ext.sql.UpdateResult;
 import io.vertx.ext.web.Router;
@@ -41,7 +42,6 @@ public class MyFirstVerticle extends AbstractVerticle {
   public void start(Future<Void> fut) {
     System.out.println("app start");
     JsonObject config = new JsonObject();
-    config.put("port", "8080");
     config.put("url", "jdbc:hsqldb:mem:test?shutdown=true");
     config.put("driver_class", "org.hsqldb.jdbcDriver");
     jdbc = JDBCClient.createShared(vertx, config, "My-Whisky-Collection");
@@ -65,9 +65,9 @@ public class MyFirstVerticle extends AbstractVerticle {
     router.get("/api/whiskies").handler(this::getAllInDB);
     router.get("/api/whiskies/:id").handler(this::getOne);
     router.route("/api/whiskies*").handler(BodyHandler.create());
-    router.post("/api/whiskies").handler(this::addOne);
-    router.put("/api/whiskies/:id").handler(this::updateOne);
-    router.delete("/api/whiskies/:id").handler(this::deleteOne);
+    router.post("/api/whiskies").handler(this::addOneInDB);
+    router.put("/api/whiskies/:id").handler(this::updateOneInDB);
+    router.delete("/api/whiskies/:id").handler(this::deleteOneInDB);
 
     // Serve static resources from the /assets directory
     router.route("/assets/*").handler(StaticHandler.create("assets"));
@@ -155,6 +155,53 @@ public class MyFirstVerticle extends AbstractVerticle {
       });
   }
 
+  private void update(Whisky whisky, SQLConnection connection, Handler<AsyncResult<Whisky>> next) {
+    System.out.println("update");
+    String sql = "UPDATE Whisky SET name = ?, origin = ? WHERE id = ?";
+    connection.updateWithParams(sql,
+      new JsonArray().add(whisky.getName()).add(whisky.getOrigin()).add(whisky.getId()),
+      (ar) -> {
+        if (ar.failed()) {
+          next.handle(Future.failedFuture(ar.cause()));
+          return;
+        }
+        UpdateResult result = ar.result();
+        // Build a new whisky instance with the generated id.
+        Whisky w = new Whisky(whisky.getId(), whisky.getName(), whisky.getOrigin());
+        next.handle(Future.succeededFuture(w));
+      });
+  }
+
+  private void delete(int id, SQLConnection connection, Handler<AsyncResult<JsonObject>> next) {
+    System.out.println("delete");
+    String sql = "DELETE FROM Whisky WHERE id = ?";
+    connection.updateWithParams(sql,
+      new JsonArray().add(id),
+      (ar) -> {
+        if (ar.failed()) {
+          next.handle(Future.failedFuture(ar.cause()));
+          return;
+        }
+        UpdateResult result = ar.result();
+        next.handle(Future.succeededFuture(result.toJson()));
+      });
+  }
+
+  private void get(int id, SQLConnection connection, Handler<AsyncResult<ResultSet>> next) {
+    System.out.println("get");
+    String sql = "SELECT * FROM Whisky WHERE id = ?";
+    connection.queryWithParams(sql,
+      new JsonArray().add(id),
+      (ar) -> {
+        if (ar.failed()) {
+          next.handle(Future.failedFuture(ar.cause()));
+          return;
+        }
+        ResultSet result = ar.result();
+        next.handle(Future.succeededFuture(result));
+      });
+  }
+
   private void getAllInDB(RoutingContext routingContext) {
     jdbc.getConnection(ar -> {
       SQLConnection connection = ar.result();
@@ -166,6 +213,90 @@ public class MyFirstVerticle extends AbstractVerticle {
         connection.close(); // Close the connection
       });
     });
+  }
+
+  private void addOneInDB(RoutingContext routingContext) {
+    final Whisky whisky = Json.decodeValue(routingContext.getBodyAsString(),
+      Whisky.class);
+    System.out.printf("add whisky:%s", whisky.getId());
+    jdbc.getConnection(ar -> {
+      SQLConnection connection = ar.result();
+      insert(whisky, connection, result -> {
+        routingContext.response()
+          .setStatusCode(201)
+          .putHeader("content-type", "application/json; charset=utf-8")
+          .end(Json.encodePrettily(whisky));
+        connection.close(); // Close the connection
+      });
+    });
+  }
+
+  private void deleteOneInDB(RoutingContext routingContext) {
+    String id = routingContext.request().getParam("id");
+    if (id == null) {
+      routingContext.response().setStatusCode(400).end();
+    } else {
+      jdbc.getConnection(ar -> {
+        SQLConnection connection = ar.result();
+        delete(Integer.valueOf(id), connection, result -> {
+          routingContext.response().setStatusCode(204).end();
+          connection.close(); // Close the connection
+        });
+      });
+    }
+  }
+
+  private void updateOneInDB(RoutingContext routingContext) {
+    String id = routingContext.request().getParam("id");
+    JsonObject json = routingContext.getBodyAsJson();
+    if (id == null || !products.containsKey(Integer.valueOf(id)) || json == null) {
+      routingContext.response().setStatusCode(400).end();
+    } else {
+      final Whisky whisky = new Whisky(Integer.valueOf(id),json.getString("name"), json.getString("origin"));
+      jdbc.getConnection(ar -> {
+        SQLConnection connection = ar.result();
+        update(whisky, connection, result -> {
+          routingContext.response()
+            .putHeader("content-type", "application/json; charset=utf-8")
+            .end(Json.encodePrettily(whisky));
+          connection.close(); // Close the connection
+        });
+      });
+    }
+  }
+
+  private void getOneInDB(RoutingContext routingContext) {
+    final String id = routingContext.request().getParam("id");
+    if (id == null) {
+      routingContext.response().setStatusCode(400).end();
+    } else {
+      final Integer idAsInteger = Integer.valueOf(id);
+      jdbc.getConnection(ar -> {
+        SQLConnection connection = ar.result();
+        get(idAsInteger, connection, result -> {
+          List<Whisky> whiskies = result.result().getRows().stream().map(Whisky::new).collect(Collectors.toList());
+          if (whiskies == null || whiskies.size() == 0) {
+            routingContext.response().setStatusCode(404).end();
+          } else if (whiskies.size() > 0) {
+            routingContext.response().putHeader("content-type", "application/json; charset=utf-8")
+              .end(Json.encodePrettily(new JsonObject()));
+          } else {
+              routingContext.response()
+                .putHeader("content-type", "application/json; charset=utf-8")
+                .end(Json.encodePrettily(whiskies.get(0)));
+          }
+          connection.close(); // Close the connection
+        });
+      });
+      Whisky whisky = products.get(idAsInteger);
+      if (whisky == null) {
+        routingContext.response().setStatusCode(404).end();
+      } else {
+        routingContext.response()
+          .putHeader("content-type", "application/json; charset=utf-8")
+          .end(Json.encodePrettily(whisky));
+      }
+    }
   }
 
 
